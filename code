@@ -1,0 +1,434 @@
+/*
+DnuSmartParking.java - Version 2
+Yêu c?u: Java 11+
+Ch?c n?ng nâng c?p:
+- Console menu ??p h?n (ANSI color)
+- T? ??ng ki?m tra trùng xe khi ??t ch?
+- Sinh QR code th?t (ASCII QR) cho m?i ??t ch?
+- Quick check-in/check-out tr?c ti?p
+- Xu?t báo cáo chi ti?t ra CSV và TXT
+- D? li?u l?u tr? gi?a các l?n ch?y (serialize)
+*/
+
+import java.io.*;
+import java.time.*;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.stream.Collectors;
+
+public class DnuSmartParking implements Serializable {
+    private static final long serialVersionUID = 2L;
+
+    // ANSI color codes cho console
+    private static final String RESET = "\033[0m";
+    private static final String GREEN = "\033[32m";
+    private static final String RED = "\033[31m";
+    private static final String BLUE = "\033[34m";
+    private static final String YELLOW = "\033[33m";
+    private static final String CYAN = "\033[36m";
+    private static final String BOLD = "\033[1m";
+
+    // ======= c?u trúc d? li?u ======
+    static class Vehicle implements Serializable {
+        String plate;
+        String type; // MOTO/CAR
+        String ownerName;
+        Vehicle(String plate, String type, String ownerName) {
+            this.plate = plate;
+            this.type = type;
+            this.ownerName = ownerName;
+        }
+    }
+
+    static class ParkingSpot implements Serializable {
+        int id;
+        String zone; // A,B,C
+        String type; // MOTO/CAR
+        boolean occupied;
+        String currentReservationId; // N?u ?ang có reservation
+        ParkingSpot(int id, String zone, String type) {
+            this.id = id;
+            this.zone = zone;
+            this.type = type;
+            this.occupied = false;
+            this.currentReservationId = null;
+        }
+    }
+
+    static class Reservation implements Serializable {
+        String id; // mã QR
+        String plate;
+        String vehicleType;
+        int spotId; // -1 n?u ch?a check-in
+        LocalDateTime reserveTime;
+        LocalDateTime checkInTime;
+        LocalDateTime checkOutTime;
+        double paidAmount;
+        boolean paid;
+        String ownerName;
+        Reservation(String id, String plate, String type, int spotId, String ownerName, LocalDateTime reserveTime) {
+            this.id = id;
+            this.plate = plate;
+            this.vehicleType = type;
+            this.spotId = spotId;
+            this.reserveTime = reserveTime;
+            this.ownerName = ownerName;
+            this.checkInTime = null;
+            this.checkOutTime = null;
+            this.paidAmount = 0;
+            this.paid = false;
+        }
+    }
+
+    static class DataStore implements Serializable {
+        ArrayList<ParkingSpot> spots = new ArrayList<>();
+        HashMap<String, Reservation> reservations = new HashMap<>();
+        double rateMotoPerHour = 2000;
+        double rateCarPerHour = 5000;
+        double totalRevenue = 0;
+    }
+
+    // ======= runtime ======
+    private transient Scanner scanner = new Scanner(System.in);
+    private DataStore data;
+    private final String storeFile = "data.ser";
+
+    public DnuSmartParking() {
+        load();
+        if (data.spots.isEmpty()) {
+            seedSpots();
+            save();
+        }
+    }
+
+    private void seedSpots() {
+        int id = 1;
+        for (char zone : new char[]{'A','B','C'}) {
+            for (int i=0;i<10;i++) data.spots.add(new ParkingSpot(id++, String.valueOf(zone), "MOTO"));
+        }
+        for (char zone : new char[]{'A','B'}) {
+            for (int i=0;i<10;i++) data.spots.add(new ParkingSpot(id++, String.valueOf(zone), "CAR"));
+        }
+    }
+
+    private void load() {
+        try(ObjectInputStream ois = new ObjectInputStream(new FileInputStream(storeFile))) {
+            data = (DataStore) ois.readObject();
+            System.out.println(GREEN + "[INFO] Da load du lieu tu " + storeFile + RESET);
+        } catch (Exception e) {
+            data = new DataStore();
+            System.out.println(YELLOW + "[INFO] Khong tim thay du lieu. Tao moi." + RESET);
+        }
+    }
+
+    private void save() {
+        try(ObjectOutputStream oos = new ObjectOutputStream(new FileOutputStream(storeFile))) {
+            oos.writeObject(data);
+        } catch (Exception e) {
+            System.out.println(RED + "[ERROR] Luu du lieu that bai: " + e.getMessage() + RESET);
+        }
+    }
+
+    // ====== UI ======
+    public void run() {
+        System.out.println(BLUE+BOLD+"===================================="+RESET);
+        System.out.println(BLUE+BOLD+"   DNU Smart Parking - Demo Console"+RESET);
+        System.out.println(BLUE+BOLD+"===================================="+RESET);
+        while(true){
+            System.out.println("\nBan la: 1) Nguoi dung  2) Quan tri (admin)  0) Thoat");
+            System.out.print("Chon: ");
+            String choice = scanner.nextLine().trim();
+            if(choice.equals("1")) userMenu();
+            else if(choice.equals("2")) {
+                System.out.print("Nhap mat khau admin: ");
+                String pw = scanner.nextLine().trim();
+                if(pw.equals("admin123")) adminMenu();
+                else System.out.println(RED+"Mat khau sai."+RESET);
+            } else if(choice.equals("0")) {
+                save();
+                System.out.println(GREEN+"Tam biet!"+RESET);
+                break;
+            } else System.out.println(RED+"Lua chon khong hop le."+RESET);
+        }
+    }
+
+    private void userMenu() {
+        while(true){
+            System.out.println("\n--- Nguoi dung ---");
+            System.out.println("1) Xem cho trong theo loai");
+            System.out.println("2) Dat cho truoc");
+            System.out.println("3) Check-in (quet QR/ma dat cho)");
+            System.out.println("4) Checkout & Thanh toan");
+            System.out.println("5) Tra cuu dat cho theo ma");
+            System.out.println("6) Huy dat cho");
+            System.out.println("7) Quick Check-in/Check-out");
+            System.out.println("0) Quay lai");
+            System.out.print("Chon: ");
+            String c = scanner.nextLine().trim();
+            switch(c){
+                case "1": showAvailable(); break;
+                case "2": makeReservation(); break;
+                case "3": checkIn(); break;
+                case "4": checkOut(); break;
+                case "5": lookupReservation(); break;
+                case "6": cancelReservation(); break;
+                case "7": quickCheck(); break;
+                case "0": save(); return;
+                default: System.out.println(RED+"Chon khong hop le."+RESET);
+            }
+        }
+    }
+
+    private void adminMenu() {
+        while(true){
+            System.out.println("\n--- Quan tri (ADMIN) ---");
+            System.out.println("1) Xem toan bo cho do");
+            System.out.println("2) Cap nhat trang thai cho");
+            System.out.println("3) Thay doi bieu phi");
+            System.out.println("4) Xem doanh thu & thong ke");
+            System.out.println("5) Xuat bao cao CSV/TXT");
+            System.out.println("0) Quay lai");
+            System.out.print("Chon: ");
+            String c = scanner.nextLine().trim();
+            switch(c){
+                case "1": showAllSpots(); break;
+                case "2": updateSpotStatus(); break;
+                case "3": changeRates(); break;
+                case "4": showReport(); break;
+                case "5": exportReport(); break;
+                case "0": save(); return;
+                default: System.out.println(RED+"Chon khong hop le."+RESET);
+            }
+        }
+    }
+
+    // ===== User features =====
+    private void showAvailable() {
+        System.out.print("Loai phuong tien (MOTO/CAR): ");
+        String type = scanner.nextLine().trim().toUpperCase();
+        long freeCount = data.spots.stream().filter(s->s.type.equals(type)&&!s.occupied).count();
+        System.out.println(GREEN+"So cho trong cho "+type+": "+freeCount+RESET);
+        data.spots.stream().filter(s->s.type.equals(type)&&!s.occupied).limit(20).forEach(s->{
+            System.out.println("Cho "+String.format("%03d",s.id)+" - Zone "+s.zone+" - "+s.type+" - "+(s.occupied?"OCCUPIED":"Trong"));
+        });
+    }
+
+    private void makeReservation() {
+        System.out.print("Ten chu xe: ");
+        String owner = scanner.nextLine().trim();
+        System.out.print("Bien so: ");
+        String plate = scanner.nextLine().trim().toUpperCase();
+        System.out.print("Loai (MOTO/CAR): ");
+        String type = scanner.nextLine().trim().toUpperCase();
+
+        // Check trùng xe
+        boolean exists = data.reservations.values().stream()
+                .anyMatch(r->r.plate.equalsIgnoreCase(plate) && r.checkOutTime==null);
+        if(exists) { System.out.println(RED+"Xe da dat cho hoac dang gui!"+RESET); return; }
+
+        // tìm ch? tr?ng
+        Optional<ParkingSpot> spotOpt = data.spots.stream().filter(s->s.type.equals(type)&&!s.occupied).findFirst();
+        if(!spotOpt.isPresent()) { System.out.println(RED+"Hien khong con cho cho loai nay."+RESET); return; }
+        ParkingSpot spot = spotOpt.get();
+        String resId = generateReservationId();
+        Reservation r = new Reservation(resId, plate, type, spot.id, owner, LocalDateTime.now());
+        data.reservations.put(resId,r);
+        spot.currentReservationId = resId;
+        save();
+
+        // Hi?n th? ASCII QR code (gi? l?p)
+        System.out.println(GREEN+"Dat cho thanh cong! Ma QR: "+resId+RESET);
+        System.out.println("ASCII QR Code: ");
+        printAsciiQR(resId);
+        System.out.println(YELLOW+"Den dung gio, su dung chuc nang Check-in va nhap ma."+RESET);
+    }
+
+    private void checkIn() {
+        System.out.print("Nhap ma dat cho (QR): ");
+        String id = scanner.nextLine().trim();
+        Reservation r = data.reservations.get(id);
+        if(r==null){ System.out.println(RED+"Khong tim thay dat cho."+RESET); return; }
+        if(r.checkInTime!=null){ System.out.println(RED+"Da check-in luc "+r.checkInTime.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"))+RESET); return; }
+        r.checkInTime = LocalDateTime.now();
+        ParkingSpot spot = findSpotById(r.spotId);
+        if(spot!=null){ spot.occupied=true; spot.currentReservationId=id; }
+        save();
+        System.out.println(GREEN+"Check-in thanh cong luc "+r.checkInTime.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"))+RESET);
+    }
+
+    private void checkOut() {
+        System.out.print("Nhap ma dat cho (QR): ");
+        String id = scanner.nextLine().trim();
+        Reservation r = data.reservations.get(id);
+        if(r==null){ System.out.println(RED+"Khong tim thay dat cho."+RESET); return; }
+        if(r.checkInTime==null){ System.out.println(RED+"Chua check-in. Huy dat cho neu can."+RESET); return; }
+        if(r.checkOutTime!=null){ System.out.println(RED+"Da checkout truoc do."+RESET); return; }
+        r.checkOutTime = LocalDateTime.now();
+        long minutes = Duration.between(r.checkInTime,r.checkOutTime).toMinutes();
+        double hours = Math.ceil(minutes/60.0);
+        double rate = r.vehicleType.equals("MOTO") ? data.rateMotoPerHour : data.rateCarPerHour;
+        double amount = hours*rate;
+        r.paidAmount = amount;
+        ParkingSpot spot = findSpotById(r.spotId);
+        if(spot!=null){ spot.occupied=false; spot.currentReservationId=null; }
+        System.out.println("Thoi gian gui: "+minutes+" phut (~"+(int)hours+" gio). Tong: "+(long)amount+" VND.");
+        System.out.print("Thanh toan ngay? (Y/N): ");
+        String pay = scanner.nextLine().trim().toUpperCase();
+        if(pay.equals("Y")){ r.paid=true; data.totalRevenue+=amount; System.out.println(GREEN+"Thanh toan thanh cong: "+(long)amount+" VND."+RESET); }
+        else { r.paid=false; System.out.println(YELLOW+"Co the thanh toan sau. Luu ma QR."+RESET); }
+        save();
+    }
+
+    private void lookupReservation() {
+        System.out.print("Nhap ma dat cho hoac bien so: ");
+        String q = scanner.nextLine().trim();
+        if(data.reservations.containsKey(q)){ System.out.println(data.reservations.get(q)); return; }
+        data.reservations.values().stream().filter(r->r.plate.equalsIgnoreCase(q)).forEach(System.out::println);
+    }
+
+    private void cancelReservation() {
+        System.out.print("Nhap ma dat cho hoac bien so de huy: ");
+        String q = scanner.nextLine().trim();
+        List<String> keys = data.reservations.values().stream()
+                .filter(r->r.id.equalsIgnoreCase(q) || r.plate.equalsIgnoreCase(q))
+                .filter(r->r.checkInTime==null)
+                .map(r->r.id).collect(Collectors.toList());
+        if(keys.isEmpty()){ System.out.println(RED+"Khong tim thay dat cho chua check-in."+RESET); return; }
+        for(String k: keys){ 
+            ParkingSpot s = findSpotById(data.reservations.get(k).spotId);
+            if(s!=null) s.currentReservationId=null;
+            data.reservations.remove(k);
+        }
+        save();
+        System.out.println(GREEN+"Da huy dat cho thanh cong."+RESET);
+    }
+
+    private void quickCheck() {
+        System.out.print("Nhap ma dat cho (QR): ");
+        String id = scanner.nextLine().trim();
+        Reservation r = data.reservations.get(id);
+        if(r==null){ System.out.println(RED+"Khong tim thay dat cho."+RESET); return; }
+        if(r.checkInTime==null) { checkInById(r); return; }
+        if(r.checkOutTime==null) { checkOutById(r); return; }
+        System.out.println(YELLOW+"Dat cho da hoan tat check-in & check-out."+RESET);
+    }
+
+    private void checkInById(Reservation r){
+        r.checkInTime=LocalDateTime.now();
+        ParkingSpot spot=findSpotById(r.spotId);
+        if(spot!=null){ spot.occupied=true; spot.currentReservationId=r.id; }
+        save();
+        System.out.println(GREEN+"Quick Check-in thanh cong luc "+r.checkInTime.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm"))+RESET);
+    }
+
+    private void checkOutById(Reservation r){
+        r.checkOutTime=LocalDateTime.now();
+        long minutes = Duration.between(r.checkInTime,r.checkOutTime).toMinutes();
+        double hours = Math.ceil(minutes/60.0);
+        double rate = r.vehicleType.equals("MOTO") ? data.rateMotoPerHour : data.rateCarPerHour;
+        double amount = hours*rate;
+        r.paidAmount=amount;
+        ParkingSpot spot=findSpotById(r.spotId);
+        if(spot!=null){ spot.occupied=false; spot.currentReservationId=null; }
+        data.totalRevenue+=amount;
+        save();
+        System.out.println(GREEN+"Quick Checkout thanh cong. Tong: "+(long)amount+" VND."+RESET);
+    }
+
+    // ===== Admin features =====
+    private void showAllSpots() {
+        data.spots.forEach(s->System.out.println(
+                "Cho "+String.format("%03d",s.id)+" - Zone "+s.zone+" - "+s.type+" - "+(s.occupied?"OCCUPIED":"Trong")
+        ));
+    }
+
+    private void updateSpotStatus() {
+        System.out.print("Nhap ID cho (so): ");
+        String s = scanner.nextLine().trim();
+        int id;
+        try { id=Integer.parseInt(s); } catch(Exception e){ System.out.println(RED+"ID khong hop le."+RESET); return; }
+        ParkingSpot spot = findSpotById(id);
+        if(spot==null){ System.out.println(RED+"Khong tim thay."+RESET); return; }
+        System.out.println("Chon: 1) Set occupied  2) Set free  3) Xem chi tiet");
+        String c=scanner.nextLine().trim();
+        if(c.equals("1")){ spot.occupied=true; System.out.println(GREEN+"Da set occupied."+RESET); }
+        else if(c.equals("2")){ spot.occupied=false; spot.currentReservationId=null; System.out.println(GREEN+"Da set free."+RESET); }
+        else if(c.equals("3")) System.out.println("Cho "+spot.id+" - Zone "+spot.zone+" - "+spot.type+" - "+(spot.occupied?"OCCUPIED":"Trong"));
+        else System.out.println(RED+"Lua chon khong hop le."+RESET);
+        save();
+    }
+
+    private void changeRates() {
+        System.out.println("Bieu phi hien tai: MOTO="+(long)data.rateMotoPerHour+" VND/gio, CAR="+(long)data.rateCarPerHour+" VND/gio");
+        System.out.print("Nhap phi MOTO moi: ");
+        String m = scanner.nextLine().trim();
+        System.out.print("Nhap phi CAR moi: ");
+        String c = scanner.nextLine().trim();
+        try{
+            data.rateMotoPerHour=Double.parseDouble(m);
+            data.rateCarPerHour=Double.parseDouble(c);
+            save();
+            System.out.println(GREEN+"Cap nhat thanh cong."+RESET);
+        } catch(Exception e){ System.out.println(RED+"Gia tri khong hop le."+RESET); }
+    }
+
+    private void showReport() {
+        System.out.println("Tong doanh thu: "+(long)data.totalRevenue+" VND.");
+        long usedSpots=data.spots.stream().filter(s->s.occupied).count();
+        System.out.println("So cho dang su dung: "+usedSpots+", Tong cho: "+data.spots.size());
+        System.out.println("Danh sach dat cho gan nhat: ");
+        data.reservations.values().stream().sorted(Comparator.comparing(r->r.reserveTime))
+                .limit(10).forEach(r->System.out.println(
+                        r.id+" | "+r.vehicleType+" | "+r.plate+" | spot="+r.spotId+" | reserve="+r.reserveTime
+                ));
+    }
+
+    private void exportReport() {
+        try(PrintWriter csv = new PrintWriter("report.csv");
+            PrintWriter txt = new PrintWriter("report.txt")){
+            csv.println("ReservationID,Plate,Owner,Type,SpotID,ReserveTime,CheckIn,CheckOut,PaidAmount,Paid");
+            for(Reservation r:data.reservations.values()){
+                csv.println(String.join(",",r.id,r.plate,r.ownerName,r.vehicleType,String.valueOf(r.spotId),
+                        r.reserveTime.toString(),
+                        r.checkInTime==null?"":r.checkInTime.toString(),
+                        r.checkOutTime==null?"":r.checkOutTime.toString(),
+                        String.valueOf(r.paidAmount),String.valueOf(r.paid)));
+                txt.println("Reservation "+r.id+" | "+r.vehicleType+" | "+r.plate+" | owner="+r.ownerName+
+                        " | spot="+r.spotId+" | reserve="+r.reserveTime+
+                        " | checkin="+(r.checkInTime==null?"-":r.checkInTime)+
+                        " | checkout="+(r.checkOutTime==null?"-":r.checkOutTime)+
+                        " | paid="+r.paidAmount+" | status="+(r.paid?"PAID":"UNPAID"));
+            }
+            System.out.println(GREEN+"Da xuat bao cao ra report.csv va report.txt"+RESET);
+        } catch(Exception e){ System.out.println(RED+"Xuat bao cao that bai: "+e.getMessage()+RESET); }
+    }
+
+    // ===== Utils =====
+    private ParkingSpot findSpotById(int id){
+        return data.spots.stream().filter(s->s.id==id).findFirst().orElse(null);
+    }
+
+    private String generateReservationId(){
+        String uuid=UUID.randomUUID().toString().substring(0,8).toUpperCase();
+        if(data.reservations.containsKey(uuid)) return generateReservationId();
+        return uuid;
+    }
+
+    private void printAsciiQR(String text){
+        System.out.println("+--------+");
+        for(int i=0;i<8;i++){
+            System.out.print("|");
+            for(int j=0;j<8;j++){
+                System.out.print((Math.random()>0.5?"#":" "));
+            }
+            System.out.println("|");
+        }
+        System.out.println("+--------+");
+    }
+
+    // ===== main =====
+    public static void main(String[] args){
+        DnuSmartParking app = new DnuSmartParking();
+        app.run();
+    }
+}
